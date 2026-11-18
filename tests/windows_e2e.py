@@ -22,7 +22,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ssdtool import winutil  # noqa: E402
+from ssdtool import diskerase, privacy, winutil  # noqa: E402
 from ssdtool.device import RawDevice, volume_path  # noqa: E402
 from ssdtool.ntfs import NTFSVolume  # noqa: E402
 from ssdtool.recover import recover_files  # noqa: E402
@@ -158,12 +158,121 @@ def main() -> int:
         chk = subprocess.run(["chkdsk", f"{letter}:", "/scan"], capture_output=True, text=True,
                              encoding="oem", errors="replace")
         assert chk.returncode == 0, chk.stdout[-1500:]
-        print("Windows-E2E erfolgreich.")
+        print("Windows-E2E (Wiederherstellung/Wipe) erfolgreich.")
         return 0
     finally:
         diskpart(f'select vdisk file="{vhd}"\ndetach vdisk\n', check=False)  # may already be detached
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_disk_erase() -> None:
+    """Erase a complete (virtual) disk and verify nothing of it survives."""
+    disks = diskerase.list_disks()
+    print("Datenträger:", [(d["number"], d["model"], d["bus"], d["letters"], d["blocked"]) for d in disks])
+    system = [d for d in disks if os.environ.get("SystemDrive", "C:")[0] in d["letters"]]
+    assert system and all(d["blocked"] for d in system), "Systemdatenträger muss gesperrt sein"
+    try:
+        diskerase.erase_disk(system[0]["number"], system[0]["serial"])
+        raise AssertionError("Systemdatenträger durfte nicht gelöscht werden")
+    except diskerase.EraseError as exc:
+        print("Systemdatenträger korrekt abgelehnt:", exc)
+
+    work = tempfile.mkdtemp(prefix="ssdtool-erase-")
+    vhd = os.path.join(work, "erase.vhd")
+    letter = free_letter()
+    diskpart(f'create vdisk file="{vhd}" maximum=64 type=fixed\nselect vdisk file="{vhd}"\nattach vdisk\n'
+             f'create partition primary\nformat fs=ntfs quick label=ALT\nassign letter={letter}\n')
+    try:
+        for _ in range(50):
+            if os.path.exists(f"{letter}:\\"):
+                break
+            time.sleep(0.2)
+        with open(f"{letter}:\\geheim.bin", "wb") as fh:
+            fh.write(MARKER * 100_000)
+        disk = next(d for d in diskerase.list_disks() if letter in d["letters"])
+        print("Zu löschender Datenträger:", disk)
+        assert disk["blocked"] is None, disk["blocked"]
+        report = diskerase.erase_disk(disk["number"], disk["serial"], "auto", True, "Neu",
+                                      lambda m, f: print(f"  {f:4.0%} {m}") if f in (0.0, 1.0) else None)
+        print("Bericht:", {k: v for k, v in report.items() if k != "format_output"})
+        assert report["verify"]["checked"] > 0 and report["verify"]["unchanged"] == 0, report["verify"]
+        # the new, empty volume must exist and be usable
+        after = next(d for d in diskerase.list_disks() if d["number"] == disk["number"])
+        assert after["letters"], "neu formatiertes Laufwerk hat keinen Buchstaben"
+        new_root = after["letters"][0] + ":\\"
+        assert not os.path.exists(new_root + "geheim.bin")
+        with open(new_root + "test.txt", "w") as fh:
+            fh.write("ok")
+        fd = os.open(diskerase.physical_path(disk["number"]), os.O_RDONLY | os.O_BINARY)
+        try:
+            raw = b""
+            while len(raw) < disk["size"]:
+                chunk = os.read(fd, 4 * 1024 * 1024)
+                if not chunk:
+                    break
+                raw += chunk
+        finally:
+            os.close(fd)
+        assert MARKER not in raw, "alte Daten noch auf dem Datenträger"
+        print("Datenträger-Löschung erfolgreich.")
+    finally:
+        diskpart(f'select vdisk file="{vhd}"\ndetach vdisk\n', check=False)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def test_privacy() -> None:
+    """History cleaner: registry MRU lists, junctions in Temp, analysis of the real profile."""
+    import winreg
+
+    res = privacy.analyze()
+    print("Analyse:", [(c["id"], c["files"], c["bytes"], c["entries"]) for c in res["categories"]])
+    key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, privacy.EXPLORER + r"\RunMRU")
+    winreg.SetValueEx(key, "a", 0, winreg.REG_SZ, "geheimes-programm.exe\\1")
+    winreg.SetValueEx(key, "MRUList", 0, winreg.REG_SZ, "a")
+    key.Close()
+    rd = winreg.CreateKey(winreg.HKEY_CURRENT_USER, privacy.EXPLORER + r"\RecentDocs\.pdf")
+    winreg.SetValueEx(rd, "0", 0, winreg.REG_BINARY, "Steuer.pdf".encode("utf-16-le"))
+    rd.Close()
+
+    work = tempfile.mkdtemp(prefix="ssdtool-privacy-")
+    outside = os.path.join(work, "Dokumente")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "wichtig.txt"), "w") as fh:
+        fh.write("bleibt")
+    fake_temp = os.path.join(work, "Temp")
+    os.makedirs(os.path.join(fake_temp, "sub"))
+    with open(os.path.join(fake_temp, "sub", "spur.tmp"), "w") as fh:
+        fh.write("weg")
+    subprocess.run(["cmd", "/c", "mklink", "/J", os.path.join(fake_temp, "junction"), outside], check=True)
+    old_temp = os.environ["TEMP"]
+    os.environ["TEMP"] = fake_temp
+    try:
+        results = privacy.clean(["explorer", "recent", "temp"], overwrite=True, close_browsers=False,
+                                restart_explorer=False)
+    finally:
+        os.environ["TEMP"] = old_temp
+    print("Bereinigung:", results)
+    assert open(os.path.join(outside, "wichtig.txt")).read() == "bleibt", "Junction wurde verfolgt!"
+    assert os.listdir(fake_temp) == [], os.listdir(fake_temp)
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, privacy.EXPLORER + r"\RunMRU")
+        values = winreg.QueryInfoKey(key)[1]
+        key.Close()
+    except OSError:
+        values = 0
+    assert values == 0, "RunMRU nicht geleert"
+    try:
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, privacy.EXPLORER + r"\RecentDocs").Close()
+        raise AssertionError("RecentDocs nicht gelöscht")
+    except OSError:
+        pass
+    shutil.rmtree(work, ignore_errors=True)
+    print("Verlauf-Bereinigung erfolgreich.")
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    test_privacy()
+    test_disk_erase()
+    print("Alle Windows-E2E-Tests erfolgreich.")
+    sys.exit(rc)

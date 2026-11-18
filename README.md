@@ -1,10 +1,14 @@
 # SSD-Datenretter
 
-Windows-Tool mit Browser-Oberfläche, das auf NTFS-Laufwerken (SSD, HDD,
-USB-Stick) **gelöschte Dateien findet** und sie wahlweise
+Windows-Tool mit Browser-Oberfläche. Es hat drei Bereiche:
 
-- **wiederherstellt** (in einen Ordner auf einem anderen Laufwerk) oder
-- **endgültig löscht**, sodass sie mit keinem Programm mehr gerettet werden können.
+- **Gelöschte Dateien:** findet auf NTFS-Laufwerken (SSD, HDD, USB-Stick)
+  gelöschte Dateien und stellt sie wieder her oder löscht sie endgültig, sodass
+  sie mit keinem Programm mehr gerettet werden können.
+- **Verlauf löschen:** entfernt Browserverläufe und die Nutzungsspuren, die
+  Windows speichert, und überschreibt danach den freien Speicher.
+- **SSD komplett löschen:** löscht einen ganzen Datenträger unwiederbringlich
+  (NVMe Sanitize oder Überschreiben + TRIM) und prüft das Ergebnis.
 
 Die Oberfläche läuft lokal im Browser (`http://127.0.0.1:8765`). Nichts verlässt
 den Rechner. Python-Pakete von Drittanbietern werden nicht benötigt.
@@ -46,6 +50,73 @@ Optionen: `--port 8765`, `--no-browser`, `--no-elevate`
      Danach wird TRIM ausgeführt.
 5. **Freien Speicher bereinigen** (links unten) vernichtet *alle* gelöschten Dateien
    eines Laufwerks auf einmal. Das funktioniert auch auf `C:`.
+
+### Verlauf löschen
+
+Der Reiter **Verlauf löschen** zeigt, was an Spuren vorhanden ist und wie viel
+Platz sie belegen. Du wählst die Bereiche aus und bestätigst mit `LÖSCHEN`.
+
+| Bereich | Was entfernt wird |
+|---|---|
+| Browserverlauf | Besuchte Seiten, Downloadliste, Sitzungen/offene Tabs, Formular- und Sucheingaben. Gilt für Chrome, Edge, Brave, Vivaldi, Opera und Firefox, mit allen Profilen. Bei Firefox wird nur der Verlauf aus der Datenbank entfernt, die Lesezeichen bleiben. |
+| Browser-Cache | Zwischengespeicherte Seiten, Bilder und Skripte |
+| Cookies & Website-Daten | Cookies, Local Storage, IndexedDB (standardmäßig aus, weil du sonst überall abgemeldet wirst) |
+| Zuletzt verwendete Dateien | „Zuletzt verwendet“, Sprunglisten, Verlauf der Öffnen-/Speichern-Dialoge |
+| Explorer- & Ausführen-Verlauf | Ausführen-Dialog (Win+R), Adress- und Suchleiste, UserAssist (Programmnutzung), ShellBags (geöffnete Ordner) |
+| Miniaturansichten-Cache | `thumbcache_*.db` (enthält Vorschaubilder auch von längst gelöschten Fotos) |
+| Aktivitätsverlauf | Windows-Timeline (`ActivitiesCache.db`) |
+| Temporäre Dateien, Prefetch, Befehlsverlauf, Fehlerberichte | Temp-Ordner, `C:\Windows\Prefetch`, PowerShell-Verlauf, Absturzabbilder |
+| Papierkorb, Zwischenablage, DNS-Cache | werden geleert |
+
+**Bleiben erhalten:** gespeicherte Passwörter, Lesezeichen, Autofill-Adressen und
+-Karten, Browser-Einstellungen und Erweiterungen, deine eigenen Dateien. Die
+Windows-Ereignisprotokolle fasst das Tool nicht an.
+
+**Sicher löschen:** Jede Datei wird vor dem Löschen mit Zufallsdaten
+überschrieben. Weil eine SSD neue Daten an andere Stellen schreibt, reicht das
+allein nicht. Deshalb ist die Option **„Anschließend freien Speicher des
+Systemlaufwerks bereinigen“** standardmäßig aktiv. Sie überschreibt alle
+freien Bereiche und freien MFT-Einträge und sendet danach TRIM. Danach ist der
+Verlauf auch mit Wiederherstellungsprogrammen (z. B. dem ersten Reiter) nicht
+mehr zu finden.
+
+Geöffnete Browser schließt das Tool vorher automatisch, offene Tabs gehen dabei
+verloren. Für Miniaturansichten und Explorer-Verlauf wird der Explorer kurz
+beendet und danach mit normalen Benutzerrechten neu gestartet. Starte den PC
+anschließend neu. Bereinigt wird das Benutzerkonto, das das Tool gestartet hat.
+
+### SSD komplett löschen
+
+Der Reiter **SSD komplett löschen** listet alle Datenträger auf. **Gesperrt** und
+nicht auswählbar sind:
+
+- der Datenträger, auf dem Windows läuft, mit Boot-Partition oder Auslagerungsdatei,
+- der Datenträger, von dem das Tool selbst gestartet wurde,
+- schreibgeschützte Datenträger.
+
+Nach Auswahl, Bestätigung und Eingabe von `LÖSCHEN` passiert Folgendes:
+
+1. Das Tool speichert Fingerabdrücke von 256 zufälligen Sektoren.
+2. Partitionstabelle und Partitionen werden entfernt.
+3. Gelöscht wird je nach Datenträger:
+   - **NVMe-SSDs:** Der Befehl *NVMe Sanitize* geht an die SSD, zuerst als
+     Crypto Erase, dann als Block Erase. Die SSD-Firmware löscht damit alle
+     Speicherzellen, auch Reserve- und Ersatzbereiche, an die man über die
+     normale Schnittstelle nicht herankommt (NIST 800-88 „Purge“).
+   - **SATA-SSDs, HDDs, USB-Sticks** oder NVMe ohne Sanitize-Unterstützung:
+     Jeder Sektor wird einmal mit Zufallsdaten überschrieben, danach geht TRIM
+     an den ganzen Datenträger (NIST 800-88 „Clear“). Den ATA-Befehl *Secure
+     Erase* blockiert Windows. Dafür gibt es die Tools der Hersteller (Samsung
+     Magician, Crucial Storage Executive, …).
+4. **Prüfung:** Die 256 Sektoren werden erneut gelesen. Keiner darf noch die
+   alten Daten enthalten.
+5. Optional wird der Datenträger neu partitioniert und als NTFS formatiert.
+   Formatieren sendet zusätzlich TRIM.
+
+Die SSD mit Windows lässt sich so nicht löschen, denn sie wird während des Löschens
+gebraucht. Dafür gibt es *Einstellungen → System → Wiederherstellung → Diesen PC
+zurücksetzen → Alles entfernen → Laufwerk bereinigen*, das Hersteller-Tool oder
+einen bootfähigen USB-Stick.
 
 ### Zustände
 
@@ -99,6 +170,8 @@ ssdTool/
 │   ├── scanner.py   gelöschte Einträge finden, Pfade rekonstruieren, Zustand bewerten
 │   ├── recover.py   Wiederherstellung (inkl. NTFS-komprimierter Dateien)
 │   ├── wipe.py      gezieltes Überschreiben + Bereinigung des freien Speichers
+│   ├── privacy.py   Verlauf löschen: Browser, Windows-Spuren, Registry-MRU-Listen
+│   ├── diskerase.py ganzen Datenträger löschen: NVMe Sanitize / Überschreiben + TRIM, Prüfung
 │   ├── winutil.py   Admin-Rechte, Laufwerksliste, SSD-/TRIM-Erkennung, ReTrim
 │   ├── server.py    lokaler HTTP-Server mit Token-Schutz
 │   └── web/         Oberfläche (HTML/CSS/JS)

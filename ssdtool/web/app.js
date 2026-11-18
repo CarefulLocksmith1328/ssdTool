@@ -170,6 +170,9 @@ const JOB_TITLES = {
   recover: "Dateien werden wiederhergestellt …",
   shred: "Dateien werden endgültig gelöscht …",
   wipe_free: "Freier Speicher wird bereinigt …",
+  privacy_analyze: "Spuren werden gesucht …",
+  privacy_clean: "Spuren werden entfernt …",
+  disk_erase: "Datenträger wird gelöscht …",
 };
 
 function runJob(job) {
@@ -492,6 +495,208 @@ $("#wipe-go").addEventListener("click", async () => {
     }
     loadInfo();
   } catch (e) { toast(e.message, 8000); }
+});
+
+// ---------------------------------------------------------------- tabs
+const loadedViews = new Set(["recover"]);
+document.querySelectorAll("#tabs .tab").forEach((tab) => tab.addEventListener("click", () => {
+  const view = tab.dataset.view;
+  document.querySelectorAll("#tabs .tab").forEach((t) => t.classList.toggle("active", t === tab));
+  document.querySelectorAll("main.view").forEach((m) => m.classList.toggle("hidden", m.id !== `view-${view}`));
+  try { sessionStorage.setItem("ssdtool-view", view); } catch (e) { /* ignore */ }
+  if (!loadedViews.has(view)) {
+    loadedViews.add(view);
+    if (view === "privacy") analyzePrivacy();
+    if (view === "disk") loadDisks();
+  }
+}));
+
+// ---------------------------------------------------------------- history / privacy
+const pv = { categories: [], selected: new Set() };
+
+async function analyzePrivacy() {
+  try {
+    const job = await api("POST", "privacy/analyze");
+    const done = await runJob(job);
+    pv.categories = done.result.categories;
+    if (!pv.selected.size) pv.categories.filter((c) => c.default && c.available).forEach((c) => pv.selected.add(c.id));
+    const running = done.result.running_browsers || [];
+    const banner = $("#pv-running");
+    banner.textContent = running.length
+      ? `Geöffnet: ${running.join(", ")}. Diese Browser werden vor dem Löschen geschlossen (offene Tabs gehen verloren), sofern die Option unten aktiv ist.`
+      : "";
+    banner.classList.toggle("hidden", !running.length);
+    renderPrivacy();
+  } catch (e) { toast(e.message, 8000); }
+}
+
+const nFiles = (n) => `${fmtNum(n)} ${n === 1 ? "Datei" : "Dateien"}`;
+const nEntries = (n) => `${fmtNum(n)} ${n === 1 ? "Eintrag" : "Einträge"}`;
+
+function pvAmount(c) {
+  const parts = [];
+  if (c.files) parts.push(`${nFiles(c.files)} · ${fmtSize(c.bytes)}`);
+  if (c.entries) parts.push(nEntries(c.entries));
+  if (!parts.length) return c.special ? "" : "nichts gefunden";
+  return parts.join(" · ");
+}
+
+function renderPrivacy() {
+  for (const group of ["browser", "windows"]) {
+    const items = pv.categories.filter((c) => c.group === group);
+    $(`#pv-${group}`).innerHTML = items.map((c) => {
+      const on = pv.selected.has(c.id);
+      return `<label class="pv-item ${on ? "checked" : ""} ${c.available ? "" : "disabled"}" data-id="${c.id}">
+        <input type="checkbox" ${on ? "checked" : ""} ${c.available ? "" : "disabled"}>
+        <span class="t">${esc(c.label)}</span><span class="amount">${esc(c.available ? pvAmount(c) : "nicht vorhanden")}</span>
+        <span class="d">${esc(c.description)}</span>
+        ${c.running.length ? `<span class="warn">Geöffnet: ${esc(c.running.join(", "))}</span>` : ""}
+      </label>`;
+    }).join("") || `<p class="muted small">Nichts gefunden.</p>`;
+  }
+  document.querySelectorAll(".pv-item input").forEach((input) => input.addEventListener("change", () => {
+    const id = input.closest(".pv-item").dataset.id;
+    if (input.checked) pv.selected.add(id); else pv.selected.delete(id);
+    input.closest(".pv-item").classList.toggle("checked", input.checked);
+    updatePrivacySummary();
+  }));
+  updatePrivacySummary();
+}
+
+function updatePrivacySummary() {
+  const chosen = pv.categories.filter((c) => pv.selected.has(c.id));
+  const files = chosen.reduce((a, c) => a + c.files, 0);
+  const bytes = chosen.reduce((a, c) => a + c.bytes, 0);
+  const entries = chosen.reduce((a, c) => a + c.entries, 0);
+  $("#pv-summary").textContent = chosen.length
+    ? `${chosen.length} ${chosen.length === 1 ? "Bereich" : "Bereiche"} ausgewählt · ${nFiles(files)} (${fmtSize(bytes)}) · ${nEntries(entries)}`
+    : "Nichts ausgewählt";
+  $("#pv-go").disabled = !chosen.length;
+}
+
+$("#pv-analyze").addEventListener("click", analyzePrivacy);
+bindConfirm($("#pv-confirm"), $("#pv-confirm-go"));
+
+$("#pv-go").addEventListener("click", () => {
+  const chosen = pv.categories.filter((c) => pv.selected.has(c.id));
+  $("#pv-confirm-text").textContent = "Folgende Bereiche werden unwiderruflich gelöscht:";
+  $("#pv-confirm-list").innerHTML = chosen.map((c) => `<li>${esc(c.label)}</li>`).join("")
+    + ($("#pv-wipe").checked ? `<li><b>danach: freier Speicher des Systemlaufwerks wird überschrieben + TRIM</b></li>` : "");
+  $("#pv-confirm").value = "";
+  $("#pv-confirm-go").disabled = true;
+  $("#pv-error").textContent = "";
+  show($("#dlg-privacy"));
+  $("#pv-confirm").focus();
+});
+
+$("#pv-confirm-go").addEventListener("click", async () => {
+  let job;
+  try {
+    job = await api("POST", "privacy/clean", {
+      categories: [...pv.selected], confirm: $("#pv-confirm").value.trim(),
+      overwrite: $("#pv-overwrite").checked, close_browsers: $("#pv-close").checked,
+      restart_explorer: $("#pv-explorer").checked, wipe_free: $("#pv-wipe").checked,
+    });
+  } catch (e) { $("#pv-error").textContent = e.message; return; }
+  hide($("#dlg-privacy"));
+  try {
+    const done = await runJob(job);
+    const rows = done.result.categories.map((r) => {
+      const bits = [];
+      if (r.files) bits.push(`${nFiles(r.files)} (${fmtSize(r.bytes)})`);
+      if (r.entries) bits.push(nEntries(r.entries));
+      return { ok: r.ok, name: r.label, message: [bits.join(", "), ...r.notes].filter(Boolean).join(" · ") || "nichts zu löschen" };
+    });
+    const w = done.result.wipe;
+    if (w) rows.push({ ok: true, name: "Freier Speicher bereinigt", message: `${(w.bytes / 2 ** 30).toFixed(2)} GiB überschrieben, ${fmtNum(w.mft_records)} MFT-Einträge geleert${w.retrim ? ", TRIM gesendet" : ""}` });
+    showResult("Spuren entfernt", done.message + "\n\nEin Neustart des PCs wird empfohlen, damit Windows keine Reste aus dem Arbeitsspeicher zurückschreibt.", rows);
+    analyzePrivacy();
+  } catch (e) { showResult("Vorgang nicht abgeschlossen", e.message, []); }
+});
+
+// ---------------------------------------------------------------- whole disk erase
+const dk = { disks: [], chosen: null };
+
+async function loadDisks() {
+  $("#dk-list").innerHTML = `<p class="muted small">Datenträger werden geladen …</p>`;
+  try {
+    const r = await api("GET", "disks");
+    dk.disks = r.disks;
+    if (!r.windows) { $("#dk-list").innerHTML = `<p class="muted small">Nur unter Windows verfügbar.</p>`; return; }
+    renderDisks();
+  } catch (e) { $("#dk-list").innerHTML = `<p class="error">${esc(e.message)}</p>`; }
+}
+
+function diskCard(d, asButton) {
+  const tag = asButton ? "button" : "div";
+  const media = d.bus === "NVMe" ? "NVMe-SSD" : d.media === "SSD" ? "SSD" : d.media === "HDD" ? "Festplatte" : d.bus;
+  return `<${tag} class="disk-card" ${asButton ? `data-n="${d.number}" ${d.blocked ? "disabled" : ""}` : ""}>
+    <span class="num">${d.number}</span>
+    <span class="name">${esc(d.model || "Unbekannter Datenträger")}</span>
+    <span class="meta">${fmtSize(d.size)} · ${esc(media || "")}${d.bus && d.bus !== "NVMe" && media !== d.bus ? " · " + esc(d.bus) : ""}</span>
+    <span class="meta">${d.letters.length ? "Laufwerke: " + d.letters.map((l) => l + ":").join(", ") : "keine Laufwerksbuchstaben"}${d.serial ? " · S/N " + esc(d.serial) : ""}</span>
+    ${d.blocked ? `<span class="why">🔒 ${esc(d.blocked)}</span>` : ""}
+  </${tag}>`;
+}
+
+function renderDisks() {
+  $("#dk-list").innerHTML = dk.disks.map((d) => diskCard(d, true)).join("") || `<p class="muted small">Keine Datenträger gefunden.</p>`;
+  document.querySelectorAll("#dk-list button.disk-card").forEach((b) => b.addEventListener("click", () => openDiskDialog(+b.dataset.n)));
+}
+
+function updateDiskGo() {
+  $("#dk-go").disabled = !($("#dk-ack").checked && $("#dk-confirm").value.trim() === state.info?.confirmWord);
+}
+
+function openDiskDialog(n) {
+  const d = dk.disks.find((x) => x.number === n);
+  if (!d || d.blocked) return;
+  dk.chosen = d;
+  $("#dk-confirm-disk").innerHTML = diskCard(d, false).replace(/^<div class="disk-card"\s*>|<\/div>$/g, "");
+  $("#dk-method").value = "auto";
+  $("#dk-reformat").checked = true;
+  $("#dk-label-wrap").classList.remove("hidden");
+  $("#dk-ack").checked = false;
+  $("#dk-confirm").value = "";
+  $("#dk-error").textContent = "";
+  updateDiskGo();
+  show($("#dlg-disk"));
+}
+
+$("#dk-reload").addEventListener("click", loadDisks);
+$("#dk-ack").addEventListener("change", updateDiskGo);
+$("#dk-confirm").addEventListener("input", updateDiskGo);
+$("#dk-reformat").addEventListener("change", () => $("#dk-label-wrap").classList.toggle("hidden", !$("#dk-reformat").checked));
+
+$("#dk-go").addEventListener("click", async () => {
+  const d = dk.chosen;
+  let job;
+  try {
+    job = await api("POST", "disks/erase", {
+      number: d.number, serial: d.serial, size: d.size, method: $("#dk-method").value, reformat: $("#dk-reformat").checked,
+      label: $("#dk-label").value, confirm: $("#dk-confirm").value.trim(),
+    });
+  } catch (e) { $("#dk-error").textContent = e.message; return; }
+  hide($("#dlg-disk"));
+  try {
+    const done = await runJob(job);
+    const r = done.result;
+    const v = r.verify || {};
+    const rows = r.steps.map((s) => ({ ok: !/nicht unterstützt/.test(s), name: s }));
+    if (v.checked) {
+      rows.push({
+        ok: v.unchanged === 0,
+        name: `Prüfung: ${v.changed} von ${v.checked} Stichproben verändert`,
+        message: v.unchanged ? "Einige Blöcke enthalten noch die alten Daten!" : "Keine der geprüften alten Daten ist mehr lesbar.",
+      });
+    } else rows.push({ ok: true, name: "Prüfung: Datenträger war vorher leer – keine Stichproben möglich" });
+    showResult("Datenträger gelöscht", `${r.disk} – ${r.method}`, rows);
+    loadDisks();
+    loadInfo();
+  } catch (e) {
+    showResult("Löschen fehlgeschlagen", e.message, []);
+    loadDisks();
+  }
 });
 
 loadInfo();

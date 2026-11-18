@@ -123,3 +123,50 @@ def test_scan_preview_recover_shred_via_api(server, tmp_path):
     _, files = call(base, "GET", f"/api/scans/{scan}/files", tok)
     assert [f["name"] for f in files["items"]] == ["bild.png"]
     assert MARKER not in img.raw()
+
+
+def test_new_destructive_endpoints_need_confirmation(server):
+    base, app = server
+    status, err = call(base, "POST", "/api/privacy/clean", app.token, {"categories": ["temp"]})
+    assert status == 400 and "LÖSCHEN" in err["error"]
+    status, err = call(base, "POST", "/api/disks/erase", app.token, {"number": 1})
+    assert status == 400 and "LÖSCHEN" in err["error"]
+    status, disks = call(base, "GET", "/api/disks", app.token)
+    assert status == 200 and "disks" in disks
+
+
+def test_only_one_destructive_job_at_a_time(server, tmp_path, monkeypatch):
+    import threading as _t
+
+    from ssdtool import privacy
+
+    base, app = server
+    gate = _t.Event()
+    monkeypatch.setattr(privacy, "clean", lambda *a, **k: (gate.wait(5), [])[1])
+    body = {"categories": ["temp"], "confirm": "LÖSCHEN", "wipe_free": False}
+    status, job = call(base, "POST", "/api/privacy/clean", app.token, body)
+    assert status == 200
+    status, err = call(base, "POST", "/api/privacy/clean", app.token, body)
+    assert status == 400 and "läuft bereits" in err["error"]
+    gate.set()
+    assert wait(base, app.token, job)["status"] == "done"
+
+
+def test_privacy_analyze_and_clean_via_api(server, tmp_path, monkeypatch):
+    base, app = server
+    for name in ("APPDATA", "LOCALAPPDATA", "SystemRoot", "ProgramData"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    temp = tmp_path / "Temp"
+    temp.mkdir()
+    (temp / "spur.tmp").write_bytes(b"x" * 300)
+    monkeypatch.setenv("TEMP", str(temp))
+    _, job = call(base, "POST", "/api/privacy/analyze", app.token)
+    job = wait(base, app.token, job)
+    cats = {c["id"]: c for c in job["result"]["categories"]}
+    assert cats["temp"]["files"] == 1 and cats["temp"]["bytes"] == 300
+    _, job = call(base, "POST", "/api/privacy/clean", app.token,
+                  {"categories": ["temp"], "confirm": "LÖSCHEN", "wipe_free": False})
+    job = wait(base, app.token, job)
+    assert job["status"] == "done", job
+    assert job["result"]["categories"][0]["files"] == 1
+    assert list(temp.iterdir()) == []

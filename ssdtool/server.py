@@ -21,11 +21,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__, winutil
+from . import __version__, diskerase, privacy, winutil
 from .device import DeviceError, RawDevice, find_ntfs_offset, is_volume_path, volume_path
 from .ntfs import NTFSError, NTFSVolume
 from .recover import read_preview, recover_files, same_volume
 from .scanner import scan_volume
+from .diskerase import EraseError
 from .wipe import WipeError, shred_deleted, wipe_free_space
 
 CONFIRM_WORD = "LÖSCHEN"
@@ -91,7 +92,13 @@ class App:
         self.scans: dict[str, Scan] = {}
         self.lock = threading.Lock()
 
+    EXCLUSIVE = {"shred", "wipe_free", "privacy_clean", "disk_erase"}
+
     def run_job(self, kind: str, fn) -> Job:
+        if kind in self.EXCLUSIVE:
+            busy = [j for j in self.jobs.values() if j.kind in self.EXCLUSIVE and j.status == "running"]
+            if busy:
+                raise ValueError("Es läuft bereits ein Lösch-Vorgang. Bitte warte, bis er abgeschlossen ist.")
         job = Job(kind)
         self.jobs[job.id] = job
 
@@ -105,7 +112,7 @@ class App:
             except InterruptedError:
                 job.status = "cancelled"
                 job.message = "Abgebrochen"
-            except (DeviceError, NTFSError, WipeError, ValueError, OSError) as exc:
+            except (DeviceError, NTFSError, WipeError, EraseError, ValueError, OSError) as exc:
                 job.status = "error"
                 job.error = str(exc)
             except Exception as exc:  # pragma: no cover - unexpected
@@ -216,31 +223,95 @@ class App:
         do_trim = bool(body.get("retrim", True))
 
         def work(job: Job):
-            mft_records = 0
-            note = None
-            if scrub_mft and source:
-                try:
-                    job.update("Freie MFT-Einträge werden gezählt …", 0)
-                    with RawDevice(source) as dev:
-                        mft_records = NTFSVolume(dev).free_record_count()
-                except (DeviceError, NTFSError, OSError) as exc:
-                    note = f"MFT-Bereinigung übersprungen: {exc}"
-            stats = wipe_free_space(root, mft_records, job.update, job.cancel_event.is_set)
-            if do_trim and letter:
-                job.update("TRIM wird an die SSD gesendet …", 0.98)
-                stats["retrim"] = winutil.retrim(letter)
-            stats["note"] = note
+            stats = self._wipe_free(job, root, letter, source, scrub_mft, do_trim)
             job.message = (
                 f"{stats['bytes'] / 2**30:.2f} GiB freier Speicher und "
                 f"{stats['mft_records']} MFT-Einträge überschrieben"
             )
-            # previous scan results of that drive are now stale
-            for sid, sc in list(self.scans.items()):
-                if letter and sc.drive_letter == letter:
-                    del self.scans[sid]
             return stats
 
         return self.run_job("wipe_free", work)
+
+    def _wipe_free(self, job: Job, root: str, letter: str | None, source: str | None, scrub_mft: bool,
+                   do_trim: bool, start: float = 0.0, end: float = 1.0) -> dict:
+        def update(msg: str, frac: float):
+            job.update(msg, start + (end - start) * frac)
+
+        mft_records = 0
+        note = None
+        if scrub_mft and source:
+            try:
+                update("Freie MFT-Einträge werden gezählt …", 0)
+                with RawDevice(source) as dev:
+                    mft_records = NTFSVolume(dev).free_record_count()
+            except (DeviceError, NTFSError, OSError) as exc:
+                note = f"MFT-Bereinigung übersprungen: {exc}"
+        stats = wipe_free_space(root, mft_records, update, job.cancel_event.is_set)
+        if do_trim and letter:
+            update("TRIM wird an die SSD gesendet …", 0.98)
+            stats["retrim"] = winutil.retrim(letter)
+        stats["note"] = note
+        # previous scan results of that drive are now stale
+        for sid, sc in list(self.scans.items()):
+            if letter and sc.drive_letter == letter:
+                del self.scans[sid]
+        return stats
+
+    # -- history / privacy --------------------------------------------------
+    def start_privacy_analyze(self) -> Job:
+        return self.run_job("privacy_analyze", lambda job: privacy.analyze(job.update, job.cancel_event.is_set))
+
+    def start_privacy_clean(self, body: dict) -> Job:
+        if body.get("confirm") != CONFIRM_WORD:
+            raise ValueError(f"Bitte zur Bestätigung „{CONFIRM_WORD}“ eingeben.")
+        ids = [str(i) for i in body.get("categories") or []]
+        if not ids:
+            raise ValueError("Bitte mindestens einen Bereich auswählen.")
+        wipe = bool(body.get("wipe_free", True))
+        system_letter = os.environ.get("SystemDrive", "C:")[:1].upper()
+        wipe_root = body.get("wipe_root") or (f"{system_letter}:\\" if winutil.IS_WINDOWS else None)
+
+        def work(job: Job):
+            end = 0.5 if wipe and wipe_root else 1.0
+
+            def update(msg, frac):
+                job.update(msg, end * frac)
+
+            results = privacy.clean(ids, bool(body.get("overwrite", True)), bool(body.get("close_browsers", True)),
+                                    bool(body.get("restart_explorer", True)), update, job.cancel_event.is_set)
+            out = {"categories": results, "wipe": None}
+            if wipe and wipe_root:
+                letter = system_letter if winutil.IS_WINDOWS else None
+                source = volume_path(letter) if letter else body.get("wipe_source")
+                out["wipe"] = self._wipe_free(job, wipe_root, letter, source, True, True, 0.5, 1.0)
+            files = sum(r["files"] for r in results)
+            entries = sum(r["entries"] for r in results)
+            job.message = (f"{files:,} {'Datei' if files == 1 else 'Dateien'} und {entries:,} "
+                           f"{'Verlaufseintrag' if entries == 1 else 'Verlaufseinträge'} entfernt").replace(",", ".")
+            return out
+
+        return self.run_job("privacy_clean", work)
+
+    # -- whole disk erase -----------------------------------------------------
+    def start_disk_erase(self, body: dict) -> Job:
+        if body.get("confirm") != CONFIRM_WORD:
+            raise ValueError(f"Bitte zur Bestätigung „{CONFIRM_WORD}“ eingeben.")
+        try:
+            number = int(body.get("number"))
+        except (TypeError, ValueError):
+            raise ValueError("Kein Datenträger ausgewählt.")
+        method = body.get("method") or "auto"
+        if method not in diskerase.METHODS:
+            raise ValueError("Unbekannte Löschmethode.")
+
+        def work(job: Job):
+            report = diskerase.erase_disk(number, body.get("serial") or "", method, bool(body.get("reformat", True)),
+                                          body.get("label") or "", job.update, job.cancel_event.is_set,
+                                          expected_size=int(body.get("size") or 0) or None)
+            job.message = f"Datenträger „{report['disk']}“ wurde gelöscht ({report['method']})"
+            return report
+
+        return self.run_job("disk_erase", work)
 
     def preview(self, scan_id: str, file_id: int) -> dict:
         scan = self.scans.get(scan_id)
@@ -366,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
             self._api(method, parts[1:], parse_qs(url.query))
         except ValueError as exc:
             self._error(str(exc))
-        except (DeviceError, NTFSError, WipeError, OSError) as exc:
+        except (DeviceError, NTFSError, WipeError, EraseError, OSError) as exc:
             self._error(str(exc), 500)
 
     def _static(self, path: str):
@@ -420,6 +491,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(app.start_shred(self._body()).to_dict())
         if method == "POST" and route == "wipe-free":
             return self._json(app.start_wipe_free(self._body()).to_dict())
+        if method == "POST" and route == "privacy/analyze":
+            return self._json(app.start_privacy_analyze().to_dict())
+        if method == "POST" and route == "privacy/clean":
+            return self._json(app.start_privacy_clean(self._body()).to_dict())
+        if method == "GET" and route == "disks":
+            return self._json({"disks": diskerase.list_disks(), "windows": winutil.IS_WINDOWS})
+        if method == "POST" and route == "disks/erase":
+            return self._json(app.start_disk_erase(self._body()).to_dict())
         if method == "POST" and route == "pick-folder":
             return self._json({"path": winutil.pick_folder(self._body().get("initial"))})
         if method == "POST" and route == "open-folder":

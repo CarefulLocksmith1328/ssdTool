@@ -13,18 +13,23 @@
     <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M7 9h6M7 12h10M7 15h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
     <div>
       <h1>SSD-Datenretter</h1>
-      <p class="sub">Gelöschte Dateien finden · wiederherstellen · endgültig löschen</p>
+      <p class="sub">Gelöschte Dateien retten · Spuren entfernen · SSDs sicher löschen</p>
     </div>
   </div>
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab active" data-view="recover" role="tab">Gelöschte Dateien</button>
+    <button class="tab" data-view="privacy" role="tab">Verlauf löschen</button>
+    <button class="tab" data-view="disk" role="tab">SSD komplett löschen</button>
+  </nav>
   <div class="status" id="status-chips"></div>
 </header>
 
 <div id="admin-banner" class="banner warn hidden">
-  <strong>Keine Administratorrechte.</strong> Laufwerke können nur mit Administratorrechten gelesen werden.
+  <strong>Keine Administratorrechte.</strong> Laufwerke lesen, Datenträger löschen und Systemspuren entfernen geht nur mit Administratorrechten.
   <button class="btn small" id="btn-elevate">Als Administrator neu starten</button>
 </div>
 
-<main class="layout">
+<main class="layout view" id="view-recover">
   <aside class="panel side">
     <h2>1 · Laufwerk wählen</h2>
     <div id="drives" class="drives"><p class="muted">Laufwerke werden geladen …</p></div>
@@ -124,6 +129,99 @@
     <div id="d-preview" class="preview"></div>
   </aside>
 </main>
+
+<main class="layout view hidden" id="view-privacy">
+  <section class="panel content scroll">
+    <div class="view-head">
+      <div>
+        <h2>Verlauf &amp; Spuren sicher entfernen</h2>
+        <p class="muted small">Entfernt Browserverläufe und die Nutzungsspuren, die Windows über dich speichert (für das aktuelle Benutzerkonto). Passwörter, Lesezeichen, Autofill-Daten und deine Dateien bleiben unangetastet.</p>
+      </div>
+      <button class="btn" id="pv-analyze">Neu analysieren</button>
+    </div>
+    <div id="pv-running" class="banner warn inline hidden"></div>
+    <div class="pv-grid">
+      <div><h3>Browser</h3><div id="pv-browser" class="pv-list"><p class="muted small">Wird analysiert …</p></div></div>
+      <div><h3>Windows</h3><div id="pv-windows" class="pv-list"></div></div>
+    </div>
+    <h3>Optionen</h3>
+    <div class="pv-options">
+      <label class="check"><input type="checkbox" id="pv-wipe" checked> <span><b>Anschließend freien Speicher des Systemlaufwerks bereinigen</b> – erst das macht das Löschen auf SSDs endgültig (überschreibt Reste und sendet TRIM; dauert je nach freiem Speicher einige Minuten)</span></label>
+      <label class="check"><input type="checkbox" id="pv-overwrite" checked> <span>Dateien vor dem Löschen mit Zufallsdaten überschreiben</span></label>
+      <label class="check"><input type="checkbox" id="pv-close" checked> <span>Geöffnete Browser automatisch schließen</span></label>
+      <label class="check"><input type="checkbox" id="pv-explorer" checked> <span>Explorer währenddessen kurz beenden (nötig, um Miniaturansichten und Explorer-Verlauf vollständig zu löschen; Desktop und Taskleiste verschwinden dabei kurz)</span></label>
+    </div>
+    <div class="actionbar">
+      <span id="pv-summary" class="muted"></span>
+      <span class="spacer"></span>
+      <button class="btn danger" id="pv-go" disabled>Ausgewählte Spuren entfernen …</button>
+    </div>
+  </section>
+</main>
+
+<main class="layout view hidden" id="view-disk">
+  <section class="panel content scroll">
+    <div class="view-head">
+      <div>
+        <h2>SSD / Datenträger komplett löschen</h2>
+        <p class="muted small">Löscht einen ganzen Datenträger unwiederbringlich – z. B. bevor du eine SSD verkaufst, verschenkst oder entsorgst.</p>
+      </div>
+      <button class="btn" id="dk-reload">Liste neu laden</button>
+    </div>
+    <div class="banner danger inline"><b>Alle Partitionen und Dateien des gewählten Datenträgers gehen verloren.</b> Der Datenträger mit Windows ist gesperrt. Um die System-SSD zu löschen, nutze „Diesen PC zurücksetzen → Alles entfernen → Laufwerk bereinigen“ oder das Tool des SSD-Herstellers.</div>
+    <div id="dk-list" class="disk-list"><p class="muted small">Datenträger werden geladen …</p></div>
+    <div class="info-box">
+      <h3>So wird gelöscht</h3>
+      <p><b>NVMe-SSDs:</b> Das Tool sendet den Befehl <b>Sanitize</b>. Die SSD löscht damit selbst alle Speicherzellen, auch die Reservebereiche, an die man von außen nicht herankommt. Crypto Erase dauert Sekunden, Block Erase einige Minuten.</p>
+      <p><b>SATA-SSDs, HDDs, USB-Sticks:</b> Jeder Sektor wird mit Zufallsdaten überschrieben, danach geht TRIM an den ganzen Datenträger. (Den ATA-Befehl „Secure Erase“ blockiert Windows; dafür gibt es die Tools der Hersteller.)</p>
+      <p>Zum Schluss prüft das Tool 256 zufällige Stichproben, ob die alten Daten wirklich weg sind.</p>
+    </div>
+  </section>
+</main>
+
+<!-- privacy confirm -->
+<div class="overlay hidden" id="dlg-privacy">
+  <div class="dialog">
+    <h2 class="danger-text">Spuren endgültig entfernen</h2>
+    <p id="pv-confirm-text"></p>
+    <ul class="bullets" id="pv-confirm-list"></ul>
+    <label class="field"><span>Zur Bestätigung <b class="confirm-word"></b> eingeben</span>
+      <input type="text" id="pv-confirm" autocomplete="off">
+    </label>
+    <p class="error" id="pv-error"></p>
+    <div class="dialog-actions">
+      <button class="btn" data-close>Abbrechen</button>
+      <button class="btn danger" id="pv-confirm-go" disabled>Entfernen</button>
+    </div>
+  </div>
+</div>
+
+<!-- disk erase confirm -->
+<div class="overlay hidden" id="dlg-disk">
+  <div class="dialog">
+    <h2 class="danger-text">Datenträger komplett löschen</h2>
+    <div class="disk-card selected static" id="dk-confirm-disk"></div>
+    <label class="field"><span>Methode</span>
+      <select id="dk-method">
+        <option value="auto">Automatisch (empfohlen)</option>
+        <option value="sanitize">Nur NVMe Sanitize</option>
+        <option value="overwrite">Überschreiben mit Zufallsdaten + TRIM</option>
+      </select>
+      <span class="muted small">Automatisch: NVMe Sanitize bei NVMe-SSDs, sonst Überschreiben + TRIM.</span>
+    </label>
+    <label class="check"><input type="checkbox" id="dk-reformat" checked> <span>Danach neu formatieren (NTFS), damit der Datenträger sofort wieder nutzbar ist</span></label>
+    <label class="field" id="dk-label-wrap"><span>Name des neuen Laufwerks</span><input type="text" id="dk-label" value="Gelöscht" maxlength="32"></label>
+    <label class="check"><input type="checkbox" id="dk-ack"> <span>Mir ist klar, dass <b>alle Daten auf diesem Datenträger</b> unwiederbringlich gelöscht werden.</span></label>
+    <label class="field"><span>Zur Bestätigung <b class="confirm-word"></b> eingeben</span>
+      <input type="text" id="dk-confirm" autocomplete="off">
+    </label>
+    <p class="error" id="dk-error"></p>
+    <div class="dialog-actions">
+      <button class="btn" data-close>Abbrechen</button>
+      <button class="btn danger" id="dk-go" disabled>Datenträger löschen</button>
+    </div>
+  </div>
+</div>
 
 <!-- job progress -->
 <div class="overlay hidden" id="job">
